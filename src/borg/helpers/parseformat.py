@@ -691,6 +691,7 @@ class ItemFormatter(BaseFormatter):
         ('size', 'csize', 'dsize', 'dcsize', 'num_chunks', 'unique_chunks'),
         ('mtime', 'ctime', 'atime', 'isomtime', 'isoctime', 'isoatime'),
         tuple(sorted(hash_algorithms)),
+        tuple(['chunker_params', 'chunk_ids_checksum']),
         ('archiveid', 'archivename', 'extra'),
         ('health', )
     )
@@ -757,6 +758,8 @@ class ItemFormatter(BaseFormatter):
             'csize': self.calculate_csize,
             'dsize': partial(self.sum_unique_chunks_metadata, lambda chunk: chunk.size),
             'dcsize': partial(self.sum_unique_chunks_metadata, lambda chunk: chunk.csize),
+            'chunker_params': self.hash_chunker_params,
+            'chunk_ids_checksum': self.hash_chunks,
             'num_chunks': self.calculate_num_chunks,
             'unique_chunks': partial(self.sum_unique_chunks_metadata, lambda chunk: 1),
             'isomtime': partial(self.format_iso_time, 'mtime'),
@@ -833,13 +836,31 @@ class ItemFormatter(BaseFormatter):
         # note: does not support hardlink slaves, they will be csize 0
         return item.get_size(compressed=True)
 
-    def hash_item(self, hash_function, item):
-        if 'chunks' not in item:
-            return ""
+    def prepare_hash_function(self, hash_function):
         if hash_function in hashlib.algorithms_guaranteed:
             hash = hashlib.new(hash_function)
         elif hash_function == 'xxh64':
             hash = self.xxh64()
+        return hash
+
+    def hash_chunker_params(self, item):
+        chunker_params = self.archive.metadata.get('chunker_params')
+        return '-'.join(map(repr, chunker_params))
+
+    def hash_chunks(self, item):
+        if 'chunks' not in item:
+            return ""
+        hash_function = 'sha256'
+        assert hash_function in hashlib.algorithms_guaranteed, hashlib.algorithms_guaranteed
+        hash = hashlib.new(hash_function)
+        for chunk in item.chunks:
+            hash.update(chunk.id)
+        return hash.hexdigest()
+
+    def hash_item(self, hash_function, item):
+        if 'chunks' not in item:
+            return ""
+        hash = self.prepare_hash_function(hash_function)
         for data in self.archive.pipeline.fetch_many([c.id for c in item.chunks]):
             hash.update(data)
         return hash.hexdigest()
