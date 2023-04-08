@@ -104,6 +104,14 @@ General:
             caused EROFS. You will need this to make archives from volume shadow copies
             in WSL1 (Windows Subsystem for Linux 1).
 
+Output formatting:
+    BORG_LIST_FORMAT
+        Giving the default value for ``borg list --format=X``.
+    BORG_RLIST_FORMAT
+        Giving the default value for ``borg rlist --format=X``.
+    BORG_PRUNE_FORMAT
+        Giving the default value for ``borg prune --format=X``.
+
 Some automatic "answerers" (if set, they automatically answer confirmation questions):
     BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=no (or =yes)
         For "Warning: Attempting to access a previously unknown unencrypted repository"
@@ -145,7 +153,16 @@ Directories and files:
         Defaults to ``$BORG_CONFIG_DIR/keys``.
         This directory contains keys for encrypted repositories.
     BORG_KEY_FILE
-        When set, use the given filename as repository key file.
+        When set, use the given path as repository key file. Please note that this is only
+        for rather special applications that externally fully manage the key files:
+
+        - this setting only applies to the keyfile modes (not to the repokey modes).
+        - using a full, absolute path to the key file is recommended.
+        - all directories in the given path must exist.
+        - this setting forces borg to use the key file at the given location.
+        - the key file must either exist (for most commands) or will be created (``borg rcreate``).
+        - you need to give a different path for different repositories.
+        - you need to point to the correct key file matching the repository the command will operate on.
     TMPDIR
         This is where temporary files are stored (might need a lot of temporary space for some
         operations), see tempfile_ for details.
