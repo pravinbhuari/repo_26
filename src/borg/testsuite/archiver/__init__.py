@@ -8,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from configparser import ConfigParser
 from contextlib import contextmanager
 from datetime import datetime
 from io import BytesIO, StringIO
@@ -18,17 +17,15 @@ import pytest
 from ... import xattr, platform
 from ...archive import Archive
 from ...archiver import Archiver, PURE_PYTHON_MSGPACK_WARNING
-from ...cache import Cache, LocalCache
 from ...constants import *  # NOQA
 from ...helpers import Location, umount
 from ...helpers import EXIT_SUCCESS
-from ...helpers import bin_to_hex
 from ...helpers import init_ec_warnings
 from ...logger import flush_logging
 from ...manifest import Manifest
 from ...platform import get_flags
-from ...remote import RemoteRepository
-from ...repository import Repository
+from ...remote3 import RemoteRepository3
+from ...repository3 import Repository3
 from .. import has_lchflags, is_utime_fully_supported, have_fuse_mtime_ns, st_mtime_ns_round, no_selinux
 from .. import changedir
 from .. import are_symlinks_supported, are_hardlinks_supported, are_fifos_supported
@@ -169,7 +166,7 @@ def create_src_archive(archiver, name, ts=None):
 
 
 def open_archive(repo_path, name):
-    repository = Repository(repo_path, exclusive=True)
+    repository = Repository3(repo_path, exclusive=True)
     with repository:
         manifest = Manifest.load(repository, Manifest.NO_OPERATION_CHECK)
         archive = Archive(manifest, name)
@@ -178,9 +175,9 @@ def open_archive(repo_path, name):
 
 def open_repository(archiver):
     if archiver.get_kind() == "remote":
-        return RemoteRepository(Location(archiver.repository_location))
+        return RemoteRepository3(Location(archiver.repository_location))
     else:
-        return Repository(archiver.repository_path, exclusive=True)
+        return Repository3(archiver.repository_path, exclusive=True)
 
 
 def create_regular_file(input_path, name, size=0, contents=None):
@@ -256,17 +253,13 @@ def create_test_files(input_path, create_hardlinks=True):
 
 
 def _extract_repository_id(repo_path):
-    with Repository(repo_path) as repository:
+    with Repository3(repo_path) as repository:
         return repository.id
 
 
 def _set_repository_id(repo_path, id):
-    config = ConfigParser(interpolation=None)
-    config.read(os.path.join(repo_path, "config"))
-    config.set("repository", "id", bin_to_hex(id))
-    with open(os.path.join(repo_path, "config"), "w") as fd:
-        config.write(fd)
-    with Repository(repo_path) as repository:
+    with Repository3(repo_path) as repository:
+        repository._set_id(id)
         return repository.id
 
 
@@ -346,34 +339,6 @@ def _assert_test_keep_tagged(archiver):
     assert os.listdir("output/input/tagged2"), [".NOBACKUP2"]
     assert os.listdir("output/input/tagged3"), [CACHE_TAG_NAME]
     assert sorted(os.listdir("output/input/taggedall")), [".NOBACKUP1", ".NOBACKUP2", CACHE_TAG_NAME]
-
-
-def check_cache(archiver):
-    # First run a regular borg check
-    cmd(archiver, "check")
-    # Then check that the cache on disk matches exactly what's in the repo.
-    with open_repository(archiver) as repository:
-        manifest = Manifest.load(repository, Manifest.NO_OPERATION_CHECK)
-        with Cache(repository, manifest, sync=False) as cache:
-            original_chunks = cache.chunks
-            # the LocalCache implementation has an on-disk chunks cache,
-            # but AdHocWithFilesCache and AdHocCache don't have persistent chunks cache.
-            persistent = isinstance(cache, LocalCache)
-        Cache.destroy(repository)
-        with Cache(repository, manifest) as cache:
-            correct_chunks = cache.chunks
-    if not persistent:
-        # there is no point in doing the checks
-        return
-    assert original_chunks is not correct_chunks
-    seen = set()
-    for id, (refcount, size) in correct_chunks.iteritems():
-        o_refcount, o_size = original_chunks[id]
-        assert refcount == o_refcount
-        assert size == o_size
-        seen.add(id)
-    for id, (refcount, size) in original_chunks.iteritems():
-        assert id in seen
 
 
 @contextmanager

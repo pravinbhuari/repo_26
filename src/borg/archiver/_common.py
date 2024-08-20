@@ -1,4 +1,3 @@
-import argparse
 import functools
 import os
 import textwrap
@@ -14,7 +13,9 @@ from ..helpers.nanorst import rst_to_terminal
 from ..manifest import Manifest, AI_HUMAN_SORT_KEYS
 from ..patterns import PatternMatcher
 from ..remote import RemoteRepository
+from ..remote3 import RemoteRepository3
 from ..repository import Repository
+from ..repository3 import Repository3
 from ..repoobj import RepoObj, RepoObj1
 from ..patterns import (
     ArgparsePatternAction,
@@ -29,9 +30,12 @@ from ..logger import create_logger
 logger = create_logger(__name__)
 
 
-def get_repository(location, *, create, exclusive, lock_wait, lock, append_only, make_parent_dirs, storage_quota, args):
+def get_repository(
+    location, *, create, exclusive, lock_wait, lock, append_only, make_parent_dirs, storage_quota, args, v1_or_v2
+):
     if location.proto in ("ssh", "socket"):
-        repository = RemoteRepository(
+        RemoteRepoCls = RemoteRepository if v1_or_v2 else RemoteRepository3
+        repository = RemoteRepoCls(
             location,
             create=create,
             exclusive=exclusive,
@@ -43,7 +47,8 @@ def get_repository(location, *, create, exclusive, lock_wait, lock, append_only,
         )
 
     else:
-        repository = Repository(
+        RepoCls = Repository if v1_or_v2 else Repository3
+        repository = RepoCls(
             location.path,
             create=create,
             exclusive=exclusive,
@@ -98,8 +103,7 @@ def with_repository(
         decorator_name="with_repository",
     )
 
-    # To process the `--bypass-lock` option if specified, we need to
-    # modify `lock` inside `wrapper`. Therefore we cannot use the
+    # We may need to modify `lock` inside `wrapper`. Therefore we cannot use the
     # `nonlocal` statement to access `lock` as modifications would also
     # affect the scope outside of `wrapper`. Subsequent calls would
     # only see the overwritten value of `lock`, not the original one.
@@ -129,13 +133,15 @@ def with_repository(
                 make_parent_dirs=make_parent_dirs,
                 storage_quota=storage_quota,
                 args=args,
+                v1_or_v2=False,
             )
 
             with repository:
-                if repository.version not in (2,):
+                if repository.version not in (3,):
                     raise Error(
-                        "This borg version only accepts version 2 repos for -r/--repo. "
-                        "You can use 'borg transfer' to copy archives from old to new repos."
+                        f"This borg version only accepts version 3 repos for -r/--repo, "
+                        f"but not version {repository.version}. "
+                        f"You can use 'borg transfer' to copy archives from old to new repos."
                     )
                 if manifest or cache:
                     manifest_ = Manifest.load(repository, compatibility)
@@ -185,6 +191,8 @@ def with_other_repository(manifest=False, cache=False, compatibility=None):
             if not location.valid:  # nothing to do
                 return method(self, args, **kwargs)
 
+            v1_or_v2 = getattr(args, "v1_or_v2", False)
+
             repository = get_repository(
                 location,
                 create=False,
@@ -195,11 +203,16 @@ def with_other_repository(manifest=False, cache=False, compatibility=None):
                 make_parent_dirs=False,
                 storage_quota=None,
                 args=args,
+                v1_or_v2=v1_or_v2,
             )
 
             with repository:
-                if repository.version not in (1, 2):
-                    raise Error("This borg version only accepts version 1 or 2 repos for --other-repo.")
+                acceptable_versions = (1, 2) if v1_or_v2 else (3,)
+                if repository.version not in acceptable_versions:
+                    raise Error(
+                        f"This borg version only accepts version {' or '.join(acceptable_versions)} "
+                        f"repos for --other-repo."
+                    )
                 kwargs["other_repository"] = repository
                 if manifest or cache:
                     manifest_ = Manifest.load(
@@ -500,16 +513,9 @@ def define_common_options(add_common_option):
         metavar="SECONDS",
         dest="lock_wait",
         type=int,
-        default=int(os.environ.get("BORG_LOCK_WAIT", 1)),
+        default=int(os.environ.get("BORG_LOCK_WAIT", 10)),
         action=Highlander,
         help="wait at most SECONDS for acquiring a repository/cache lock (default: %(default)d).",
-    )
-    add_common_option(
-        "--bypass-lock",
-        dest="lock",
-        action="store_false",
-        default=argparse.SUPPRESS,  # only create args attribute if option is specified
-        help="Bypass locking mechanism",
     )
     add_common_option("--show-version", dest="show_version", action="store_true", help="show/log the borg version")
     add_common_option("--show-rc", dest="show_rc", action="store_true", help="show/log the return code (rc)")

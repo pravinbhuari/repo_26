@@ -1182,18 +1182,20 @@ def ellipsis_truncate(msg, space):
 class BorgJsonEncoder(json.JSONEncoder):
     def default(self, o):
         from ..repository import Repository
+        from ..repository3 import Repository3
         from ..remote import RemoteRepository
+        from ..remote3 import RemoteRepository3
         from ..archive import Archive
-        from ..cache import LocalCache, AdHocCache, AdHocWithFilesCache
+        from ..cache import AdHocCache, AdHocWithFilesCache
 
-        if isinstance(o, Repository) or isinstance(o, RemoteRepository):
+        if isinstance(o, (Repository, RemoteRepository)) or isinstance(o, (Repository3, RemoteRepository3)):
             return {"id": bin_to_hex(o.id), "location": o._location.canonical_path()}
         if isinstance(o, Archive):
             return o.info()
-        if isinstance(o, (LocalCache, AdHocWithFilesCache)):
-            return {"path": o.path, "stats": o.stats()}
+        if isinstance(o, (AdHocWithFilesCache,)):
+            return {"path": o.path}
         if isinstance(o, AdHocCache):
-            return {"stats": o.stats()}
+            return {}
         if callable(getattr(o, "to_json", None)):
             return o.to_json()
         return super().default(o)

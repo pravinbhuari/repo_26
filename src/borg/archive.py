@@ -29,7 +29,7 @@ from .constants import *  # NOQA
 from .crypto.low_level import IntegrityError as IntegrityErrorBase
 from .helpers import BackupError, BackupRaceConditionError
 from .helpers import BackupOSError, BackupPermissionError, BackupFileNotFoundError, BackupIOError
-from .hashindex import ChunkIndex, ChunkIndexEntry, CacheSynchronizer
+from .hashindex import ChunkIndex, ChunkIndexEntry
 from .helpers import HardLinkManager
 from .helpers import ChunkIteratorFileWrapper, open_item
 from .helpers import Error, IntegrityError, set_ec
@@ -51,7 +51,8 @@ from .patterns import PathPrefixPattern, FnmatchPattern, IECommand
 from .item import Item, ArchiveItem, ItemDiff
 from .platform import acl_get, acl_set, set_flags, get_flags, swidth, hostname
 from .remote import cache_if_remote
-from .repository import Repository, LIST_SCAN_LIMIT
+from .remote3 import RemoteRepository3
+from .repository3 import Repository3, LIST_SCAN_LIMIT, NoManifestError
 from .repoobj import RepoObj
 
 has_link = hasattr(os, "link")
@@ -710,34 +711,8 @@ Duration: {0.duration}
         return metadata
 
     def calc_stats(self, cache, want_unique=True):
-        if not want_unique:
-            unique_size = 0
-        else:
-
-            def add(id):
-                entry = cache.chunks[id]
-                archive_index.add(id, 1, entry.size)
-
-            archive_index = ChunkIndex()
-            sync = CacheSynchronizer(archive_index)
-            add(self.id)
-            # we must escape any % char in the archive name, because we use it in a format string, see #6500
-            arch_name_escd = self.name.replace("%", "%%")
-            pi = ProgressIndicatorPercent(
-                total=len(self.metadata.items),
-                msg="Calculating statistics for archive %s ... %%3.0f%%%%" % arch_name_escd,
-                msgid="archive.calc_stats",
-            )
-            for id, chunk in zip(self.metadata.items, self.repository.get_many(self.metadata.items)):
-                pi.show(increase=1)
-                add(id)
-                _, data = self.repo_objs.parse(id, chunk, ro_type=ROBJ_ARCHIVE_STREAM)
-                sync.feed(data)
-            unique_size = archive_index.stats_against(cache.chunks)[1]
-            pi.finish()
-
         stats = Statistics(iec=self.iec)
-        stats.usize = unique_size
+        stats.usize = 0  # this is expensive to compute
         stats.nfiles = self.metadata.nfiles
         stats.osize = self.metadata.size
         return stats
@@ -1037,84 +1012,11 @@ Duration: {0.duration}
         self.set_meta("name", name)
         del self.manifest.archives[oldname]
 
-    def delete(self, stats, progress=False, forced=False):
-        class ChunksIndexError(Error):
-            """Chunk ID {} missing from chunks index, corrupted chunks index - aborting transaction."""
-
-        exception_ignored = object()
-
-        def fetch_async_response(wait=True):
-            try:
-                return self.repository.async_response(wait=wait)
-            except Repository.ObjectNotFound:
-                nonlocal error
-                # object not in repo - strange, but we wanted to delete it anyway.
-                if forced == 0:
-                    raise
-                error = True
-                return exception_ignored  # must not return None here
-
-        def chunk_decref(id, size, stats):
-            try:
-                self.cache.chunk_decref(id, size, stats, wait=False)
-            except KeyError:
-                nonlocal error
-                if forced == 0:
-                    cid = bin_to_hex(id)
-                    raise ChunksIndexError(cid)
-                error = True
-            else:
-                fetch_async_response(wait=False)
-
-        error = False
-        try:
-            unpacker = msgpack.Unpacker(use_list=False)
-            items_ids = self.metadata.items
-            pi = ProgressIndicatorPercent(
-                total=len(items_ids), msg="Decrementing references %3.0f%%", msgid="archive.delete"
-            )
-            for i, (items_id, data) in enumerate(zip(items_ids, self.repository.get_many(items_ids))):
-                if progress:
-                    pi.show(i)
-                _, data = self.repo_objs.parse(items_id, data, ro_type=ROBJ_ARCHIVE_STREAM)
-                unpacker.feed(data)
-                chunk_decref(items_id, 1, stats)
-                try:
-                    for item in unpacker:
-                        item = Item(internal_dict=item)
-                        if "chunks" in item:
-                            for chunk_id, size in item.chunks:
-                                chunk_decref(chunk_id, size, stats)
-                except (TypeError, ValueError):
-                    # if items metadata spans multiple chunks and one chunk got dropped somehow,
-                    # it could be that unpacker yields bad types
-                    if forced == 0:
-                        raise
-                    error = True
-            if progress:
-                pi.finish()
-        except (msgpack.UnpackException, Repository.ObjectNotFound):
-            # items metadata corrupted
-            if forced == 0:
-                raise
-            error = True
-
-        # delete the blocks that store all the references that end up being loaded into metadata.items:
-        for id in self.metadata.item_ptrs:
-            chunk_decref(id, 1, stats)
-
-        # in forced delete mode, we try hard to delete at least the manifest entry,
-        # if possible also the archive superblock, even if processing the items raises
-        # some harmless exception.
-        chunk_decref(self.id, 1, stats)
+    def delete(self):
+        # quick and dirty: we just nuke the archive from the archives list - that will
+        # potentially orphan all chunks previously referenced by the archive, except the ones also
+        # referenced by other archives. In the end, "borg compact" will clean up and free space.
         del self.manifest.archives[self.name]
-        while fetch_async_response(wait=True) is not None:
-            # we did async deletes, process outstanding results (== exceptions),
-            # so there is nothing pending when we return and our caller wants to commit.
-            pass
-        if error:
-            logger.warning("forced deletion succeeded, but the deleted archive was corrupted.")
-            logger.warning("borg check --repair is required to free all space.")
 
     @staticmethod
     def compare_archives_iter(
@@ -1852,15 +1754,16 @@ class ArchiveChecker:
         self.repair = repair
         self.repository = repository
         self.init_chunks()
-        if not self.chunks:
+        if not isinstance(repository, (Repository3, RemoteRepository3)) and not self.chunks:
             logger.error("Repository contains no apparent data at all, cannot continue check/repair.")
             return False
         self.key = self.make_key(repository)
         self.repo_objs = RepoObj(self.key)
         if verify_data:
             self.verify_data()
-        if Manifest.MANIFEST_ID not in self.chunks:
-            logger.error("Repository manifest not found!")
+        try:
+            repository.get_manifest()
+        except NoManifestError:
             self.error_found = True
             self.manifest = self.rebuild_manifest()
         else:
@@ -1869,12 +1772,12 @@ class ArchiveChecker:
             except IntegrityErrorBase as exc:
                 logger.error("Repository manifest is corrupted: %s", exc)
                 self.error_found = True
-                del self.chunks[Manifest.MANIFEST_ID]
+                if not isinstance(repository, (Repository3, RemoteRepository3)):
+                    del self.chunks[Manifest.MANIFEST_ID]
                 self.manifest = self.rebuild_manifest()
         self.rebuild_refcounts(
             match=match, first=first, last=last, sort_by=sort_by, older=older, oldest=oldest, newer=newer, newest=newest
         )
-        self.orphan_chunks_check()
         self.finish()
         if self.error_found:
             logger.error("Archive consistency check complete, problems found.")
@@ -1887,7 +1790,7 @@ class ArchiveChecker:
         # Explicitly set the initial usable hash table capacity to avoid performance issues
         # due to hash table "resonance".
         # Since reconstruction of archive items can add some new chunks, add 10 % headroom.
-        self.chunks = ChunkIndex(usable=len(self.repository) * 1.1)
+        self.chunks = ChunkIndex()
         marker = None
         while True:
             result = self.repository.list(limit=LIST_SCAN_LIMIT, marker=marker)
@@ -1900,6 +1803,20 @@ class ArchiveChecker:
 
     def make_key(self, repository):
         attempt = 0
+
+        #  try the manifest first!
+        attempt += 1
+        try:
+            cdata = repository.get_manifest()
+        except NoManifestError:
+            pass
+        else:
+            try:
+                return key_factory(repository, cdata)
+            except UnsupportedPayloadError:
+                # we get here, if the cdata we got has a corrupted key type byte
+                pass  # ignore it, just continue trying
+
         for chunkid, _ in self.chunks.iteritems():
             attempt += 1
             if attempt > 999:
@@ -1926,11 +1843,12 @@ class ArchiveChecker:
         pi = ProgressIndicatorPercent(
             total=chunks_count_index, msg="Verifying data %6.2f%%", step=0.01, msgid="check.verify_data"
         )
-        state = None
+        marker = None
         while True:
-            chunk_ids, state = self.repository.scan(limit=100, state=state)
+            chunk_ids = self.repository.list(limit=100, marker=marker)
             if not chunk_ids:
                 break
+            marker = chunk_ids[-1]
             chunks_count_segments += len(chunk_ids)
             chunk_data_iter = self.repository.get_many(chunk_ids)
             chunk_ids_revd = list(reversed(chunk_ids))
@@ -1939,7 +1857,7 @@ class ArchiveChecker:
                 chunk_id = chunk_ids_revd.pop(-1)  # better efficiency
                 try:
                     encrypted_data = next(chunk_data_iter)
-                except (Repository.ObjectNotFound, IntegrityErrorBase) as err:
+                except (Repository3.ObjectNotFound, IntegrityErrorBase) as err:
                     self.error_found = True
                     errors += 1
                     logger.error("chunk %s: %s", bin_to_hex(chunk_id), err)
@@ -2070,7 +1988,8 @@ class ArchiveChecker:
         Missing and/or incorrect data is repaired when detected
         """
         # Exclude the manifest from chunks (manifest entry might be already deleted from self.chunks)
-        self.chunks.pop(Manifest.MANIFEST_ID, None)
+        if not isinstance(self.repository, (Repository3, RemoteRepository3)):
+            self.chunks.pop(Manifest.MANIFEST_ID, None)
 
         def mark_as_possibly_superseded(id_):
             if self.chunks.get(id_, ChunkIndexEntry(0, 0)).refcount == 0:
@@ -2328,25 +2247,6 @@ class ArchiveChecker:
                 self.manifest.archives[info.name] = (new_archive_id, info.ts)
             pi.finish()
 
-    def orphan_chunks_check(self):
-        if self.check_all:
-            unused = {id_ for id_, entry in self.chunks.iteritems() if entry.refcount == 0}
-            orphaned = unused - self.possibly_superseded
-            if orphaned:
-                logger.info(f"{len(orphaned)} orphaned (unused) objects found.")
-                for chunk_id in orphaned:
-                    logger.debug(f"chunk {bin_to_hex(chunk_id)} is orphaned.")
-                # To support working with AdHocCache or AdHocWithFilesCache, we do not set self.error_found = True.
-            if self.repair and unused:
-                logger.info(
-                    "Deleting %d orphaned and %d superseded objects..." % (len(orphaned), len(self.possibly_superseded))
-                )
-                for id_ in unused:
-                    self.repository.delete(id_)
-                logger.info("Finished deleting orphaned/superseded objects.")
-        else:
-            logger.info("Orphaned objects check skipped (needs all archives checked).")
-
     def finish(self):
         if self.repair:
             logger.info("Writing Manifest.")
@@ -2503,7 +2403,7 @@ class ArchiveRecreater:
 
         target.save(comment=comment, timestamp=self.timestamp, additional_metadata=additional_metadata)
         if replace_original:
-            archive.delete(Statistics(), progress=self.progress)
+            archive.delete()
             target.rename(archive.name)
         if self.stats:
             target.start = _start

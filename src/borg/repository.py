@@ -23,7 +23,7 @@ from .helpers import msgpack
 from .helpers.lrucache import LRUCache
 from .locking import Lock, LockError, LockErrorT
 from .logger import create_logger
-from .manifest import Manifest
+from .manifest import Manifest, NoManifestError
 from .platform import SaveFile, SyncFile, sync_dir, safe_fadvise
 from .repoobj import RepoObj
 from .checksums import crc32, StreamingXXH64
@@ -1186,31 +1186,6 @@ class Repository:
             logger.info("Finished %s repository check, no problems found.", mode)
         return not error_found or repair
 
-    def scan_low_level(self, segment=None, offset=None):
-        """Very low level scan over all segment file entries.
-
-        It does NOT care about what's committed and what not.
-        It does NOT care whether an object might be deleted or superseded later.
-        It just yields anything it finds in the segment files.
-
-        This is intended as a last-resort way to get access to all repo contents of damaged repos,
-        when there is uncommitted, but valuable data in there...
-
-        When segment or segment+offset is given, limit processing to this location only.
-        """
-        for current_segment, filename in self.io.segment_iterator(start_segment=segment, end_segment=segment):
-            try:
-                for tag, key, current_offset, _, data in self.io.iter_objects(
-                    segment=current_segment, offset=offset or 0
-                ):
-                    if offset is not None and current_offset > offset:
-                        break
-                    yield key, data, tag, current_segment, current_offset
-            except IntegrityError as err:
-                logger.error(
-                    "Segment %d (%s) has IntegrityError(s) [%s] - skipping." % (current_segment, filename, str(err))
-                )
-
     def _rollback(self, *, cleanup):
         if cleanup:
             self.io.cleanup(self.io.get_segments_transaction_id())
@@ -1232,86 +1207,13 @@ class Repository:
             self.index = self.open_index(self.get_transaction_id())
         return id in self.index
 
-    def list(self, limit=None, marker=None, mask=0, value=0):
+    def list(self, limit=None, marker=None):
         """
         list <limit> IDs starting from after id <marker> - in index (pseudo-random) order.
-
-        if mask and value are given, only return IDs where flags & mask == value (default: all IDs).
         """
         if not self.index:
             self.index = self.open_index(self.get_transaction_id())
-        return [id_ for id_, _ in islice(self.index.iteritems(marker=marker, mask=mask, value=value), limit)]
-
-    def scan(self, limit=None, state=None):
-        """
-        list (the next) <limit> chunk IDs from the repository - in on-disk order, so that a client
-        fetching data in this order does linear reads and reuses stuff from disk cache.
-
-        state can either be None (initially, when starting to scan) or the object
-        returned from a previous scan call (meaning "continue scanning").
-
-        returns: list of chunk ids, state
-
-        We rely on repository.check() has run already (either now or some time before) and that:
-
-        - if we are called from a borg check command, self.index is a valid, fresh, in-sync repo index.
-        - if we are called from elsewhere, either self.index or the on-disk index is valid and in-sync.
-        - the repository segments are valid (no CRC errors).
-          if we encounter CRC errors in segment entry headers, rest of segment is skipped.
-        """
-        if limit is not None and limit < 1:
-            raise ValueError("please use limit > 0 or limit = None")
-        transaction_id = self.get_transaction_id()
-        if not self.index:
-            self.index = self.open_index(transaction_id)
-        # smallest valid seg is <uint32> 0, smallest valid offs is <uint32> 8
-        start_segment, start_offset, end_segment = state if state is not None else (0, 0, transaction_id)
-        ids, segment, offset = [], 0, 0
-        # we only scan up to end_segment == transaction_id to scan only **committed** chunks,
-        # avoiding scanning into newly written chunks.
-        for segment, filename in self.io.segment_iterator(start_segment, end_segment):
-            # the start_offset we potentially got from state is only valid for the start_segment we also got
-            # from there. in case the segment file vanished meanwhile, the segment_iterator might never
-            # return a segment/filename corresponding to the start_segment and we must start from offset 0 then.
-            start_offset = start_offset if segment == start_segment else 0
-            obj_iterator = self.io.iter_objects(segment, start_offset, read_data=False)
-            while True:
-                try:
-                    tag, id, offset, size, _ = next(obj_iterator)
-                except (StopIteration, IntegrityError):
-                    # either end-of-segment or an error - we can not seek to objects at
-                    # higher offsets than one that has an error in the header fields.
-                    break
-                if start_offset > 0:
-                    # we are using a state != None and it points to the last object we have already
-                    # returned in the previous scan() call - thus, we need to skip this one object.
-                    # also, for the next segment, we need to start at offset 0.
-                    start_offset = 0
-                    continue
-                if tag in (TAG_PUT2, TAG_PUT):
-                    in_index = self.index.get(id)
-                    if in_index and (in_index.segment, in_index.offset) == (segment, offset):
-                        # we have found an existing and current object
-                        ids.append(id)
-                        if len(ids) == limit:
-                            return ids, (segment, offset, end_segment)
-        return ids, (segment, offset, end_segment)
-
-    def flags(self, id, mask=0xFFFFFFFF, value=None):
-        """
-        query and optionally set flags
-
-        :param id: id (key) of object
-        :param mask: bitmask for flags (default: operate on all 32 bits)
-        :param value: value to set masked bits to (default: do not change any flags)
-        :return: (previous) flags value (only masked bits)
-        """
-        if not self.index:
-            self.index = self.open_index(self.get_transaction_id())
-        return self.index.flags(id, mask, value)
-
-    def flags_many(self, ids, mask=0xFFFFFFFF, value=None):
-        return [self.flags(id_, mask, value) for id_ in ids]
+        return [id_ for id_, _ in islice(self.index.iteritems(marker=marker), limit)]
 
     def get(self, id, read_data=True):
         if not self.index:
@@ -1395,6 +1297,15 @@ class Repository:
 
     def preload(self, ids):
         """Preload objects (only applies to remote repositories)"""
+
+    def get_manifest(self):
+        try:
+            return self.get(Manifest.MANIFEST_ID)
+        except self.ObjectNotFound:
+            raise NoManifestError
+
+    def put_manifest(self, data):
+        return self.put(Manifest.MANIFEST_ID, data)
 
 
 class LoggedIO:
@@ -1641,7 +1552,7 @@ class LoggedIO:
         fd.seek(0)
         return fd.read(MAGIC_LEN)
 
-    def iter_objects(self, segment, offset=0, read_data=True):
+    def iter_objects(self, segment, read_data=True):
         """
         Return object iterator for *segment*.
 
@@ -1650,14 +1561,11 @@ class LoggedIO:
         The iterator returns five-tuples of (tag, key, offset, size, data).
         """
         fd = self.get_fd(segment)
+        offset = 0
         fd.seek(offset)
-        if offset == 0:
-            # we are touching this segment for the first time, check the MAGIC.
-            # Repository.scan() calls us with segment > 0 when it continues an ongoing iteration
-            # from a marker position - but then we have checked the magic before already.
-            if fd.read(MAGIC_LEN) != MAGIC:
-                raise IntegrityError(f"Invalid segment magic [segment {segment}, offset {0}]")
-            offset = MAGIC_LEN
+        if fd.read(MAGIC_LEN) != MAGIC:
+            raise IntegrityError(f"Invalid segment magic [segment {segment}, offset {offset}]")
+        offset = MAGIC_LEN
         header = fd.read(self.header_fmt.size)
         while header:
             size, tag, key, data = self._read(
@@ -1837,25 +1745,24 @@ class LoggedIO:
                         # supporting separately encrypted metadata and data.
                         # In this case, we return enough bytes so the client can decrypt the metadata
                         # and seek over the rest (over the encrypted data).
-                        meta_len_size = RepoObj.meta_len_hdr.size
-                        meta_len = fd.read(meta_len_size)
-                        length -= meta_len_size
-                        if len(meta_len) != meta_len_size:
+                        hdr_size = RepoObj.obj_header.size
+                        hdr = fd.read(hdr_size)
+                        length -= hdr_size
+                        if len(hdr) != hdr_size:
                             raise IntegrityError(
                                 f"Segment entry meta length short read [segment {segment}, offset {offset}]: "
-                                f"expected {meta_len_size}, got {len(meta_len)} bytes"
+                                f"expected {hdr_size}, got {len(hdr)} bytes"
                             )
-                        ml = RepoObj.meta_len_hdr.unpack(meta_len)[0]
-                        meta = fd.read(ml)
-                        length -= ml
-                        if len(meta) != ml:
+                        meta_size = RepoObj.obj_header.unpack(hdr)[0]
+                        meta = fd.read(meta_size)
+                        length -= meta_size
+                        if len(meta) != meta_size:
                             raise IntegrityError(
                                 f"Segment entry meta short read [segment {segment}, offset {offset}]: "
-                                f"expected {ml}, got {len(meta)} bytes"
+                                f"expected {meta_size}, got {len(meta)} bytes"
                             )
-                        data = meta_len + meta  # shortened chunk - enough so the client can decrypt the metadata
-                        # we do not have a checksum for this data, but the client's AEAD crypto will check it.
-                    # in any case, we see over the remainder of the chunk
+                        data = hdr + meta  # shortened chunk - enough so the client can decrypt the metadata
+                    # in any case, we seek over the remainder of the chunk
                     oldpos = fd.tell()
                     seeked = fd.seek(length, os.SEEK_CUR) - oldpos
                     if seeked != length:

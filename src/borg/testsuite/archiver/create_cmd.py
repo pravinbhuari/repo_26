@@ -16,7 +16,7 @@ from ...cache import get_cache_impl
 from ...constants import *  # NOQA
 from ...manifest import Manifest
 from ...platform import is_cygwin, is_win32, is_darwin
-from ...repository import Repository
+from ...repository3 import Repository3
 from ...helpers import CommandError, BackupPermissionError
 from .. import has_lchflags
 from .. import changedir
@@ -550,7 +550,7 @@ def test_create_pattern_intermediate_folders_first(archivers, request):
     assert out_list.index("d x/b") < out_list.index("- x/b/foo_b")
 
 
-@pytest.mark.skipif(get_cache_impl() in ("adhocwithfiles", "local"), reason="only works with AdHocCache")
+@pytest.mark.skipif(get_cache_impl() != "adhoc", reason="only works with AdHocCache")
 def test_create_no_cache_sync_adhoc(archivers, request):  # TODO: add test for AdHocWithFilesCache
     archiver = request.getfixturevalue(archivers)
     create_test_files(archiver.input_path)
@@ -668,7 +668,7 @@ def test_create_dry_run(archivers, request):
     cmd(archiver, "rcreate", RK_ENCRYPTION)
     cmd(archiver, "create", "--dry-run", "test", "input")
     # Make sure no archive has been created
-    with Repository(archiver.repository_path) as repository:
+    with Repository3(archiver.repository_path) as repository:
         manifest = Manifest.load(repository, Manifest.NO_OPERATION_CHECK)
     assert len(manifest.archives) == 0
 

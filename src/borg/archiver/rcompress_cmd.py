@@ -5,7 +5,8 @@ from ._common import with_repository, Highlander
 from ..constants import *  # NOQA
 from ..compress import CompressionSpec, ObfuscateSize, Auto, COMPRESSOR_TABLE
 from ..helpers import sig_int, ProgressIndicatorPercent, Error
-
+from ..repository3 import Repository3
+from ..remote3 import RemoteRepository3
 from ..manifest import Manifest
 
 from ..logger import create_logger
@@ -23,19 +24,13 @@ def find_chunks(repository, repo_objs, stats, ctype, clevel, olevel):
     recompress_ids = []
     compr_keys = stats["compr_keys"] = set()
     compr_wanted = ctype, clevel, olevel
-    state = None
-    chunks_count = len(repository)
-    chunks_limit = min(1000, max(100, chunks_count // 1000))
-    pi = ProgressIndicatorPercent(
-        total=chunks_count,
-        msg="Searching for recompression candidates %3.1f%%",
-        step=0.1,
-        msgid="rcompress.find_chunks",
-    )
+    marker = None
+    chunks_limit = 1000
     while True:
-        chunk_ids, state = repository.scan(limit=chunks_limit, state=state)
+        chunk_ids = repository.list(limit=chunks_limit, marker=marker)
         if not chunk_ids:
             break
+        marker = chunk_ids[-1]
         for id, chunk_no_data in zip(chunk_ids, repository.get_many(chunk_ids, read_data=False)):
             meta = repo_objs.parse_meta(id, chunk_no_data, ro_type=ROBJ_DONTCARE)
             compr_found = meta["ctype"], meta["clevel"], meta.get("olevel", -1)
@@ -44,8 +39,6 @@ def find_chunks(repository, repo_objs, stats, ctype, clevel, olevel):
             compr_keys.add(compr_found)
             stats[compr_found] += 1
             stats["checked_count"] += 1
-            pi.show(increase=1)
-    pi.finish()
     return recompress_ids
 
 
@@ -129,10 +122,11 @@ class RCompressMixIn:
         chunks_limit = min(1000, max(100, recompress_candidate_count // 1000))
         uncommitted_chunks = 0
 
-        # start a new transaction
-        data = repository.get(Manifest.MANIFEST_ID)
-        repository.put(Manifest.MANIFEST_ID, data)
-        uncommitted_chunks += 1
+        if not isinstance(repository, (Repository3, RemoteRepository3)):
+            # start a new transaction
+            data = repository.get_manifest()
+            repository.put_manifest(data)
+            uncommitted_chunks += 1
 
         pi = ProgressIndicatorPercent(
             total=len(recompress_ids), msg="Recompressing %3.1f%%", step=0.1, msgid="rcompress.process_chunks"

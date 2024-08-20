@@ -11,11 +11,12 @@ from ..helpers import sysinfo
 from ..helpers import bin_to_hex, hex_to_bin, prepare_dump_dict
 from ..helpers import dash_open
 from ..helpers import StableDict
-from ..helpers import positive_int_validator, archivename_validator
+from ..helpers import archivename_validator
 from ..helpers import CommandError, RTError
 from ..manifest import Manifest
 from ..platform import get_process_id
-from ..repository import Repository, LIST_SCAN_LIMIT, TAG_PUT, TAG_DELETE, TAG_COMMIT
+from ..repository import Repository
+from ..repository3 import Repository3, LIST_SCAN_LIMIT
 from ..repoobj import RepoObj
 
 from ._common import with_repository, Highlander
@@ -99,7 +100,8 @@ class DebugMixIn:
     def do_debug_dump_manifest(self, args, repository, manifest):
         """dump decoded repository manifest"""
         repo_objs = manifest.repo_objs
-        _, data = repo_objs.parse(manifest.MANIFEST_ID, repository.get(manifest.MANIFEST_ID), ro_type=ROBJ_MANIFEST)
+        cdata = repository.get_manifest()
+        _, data = repo_objs.parse(manifest.MANIFEST_ID, cdata, ro_type=ROBJ_MANIFEST)
 
         meta = prepare_dump_dict(msgpack.unpackb(data, object_hook=StableDict))
 
@@ -108,57 +110,33 @@ class DebugMixIn:
 
     @with_repository(manifest=False)
     def do_debug_dump_repo_objs(self, args, repository):
-        """dump (decrypted, decompressed) repo objects, repo index MUST be current/correct"""
+        """dump (decrypted, decompressed) repo objects"""
         from ..crypto.key import key_factory
 
-        def decrypt_dump(i, id, cdata, tag=None, segment=None, offset=None):
+        def decrypt_dump(id, cdata):
             if cdata is not None:
                 _, data = repo_objs.parse(id, cdata, ro_type=ROBJ_DONTCARE)
             else:
                 _, data = {}, b""
-            tag_str = "" if tag is None else "_" + tag
-            segment_str = "_" + str(segment) if segment is not None else ""
-            offset_str = "_" + str(offset) if offset is not None else ""
-            id_str = "_" + bin_to_hex(id) if id is not None else ""
-            filename = "%08d%s%s%s%s.obj" % (i, segment_str, offset_str, tag_str, id_str)
+            filename = f"{bin_to_hex(id)}.obj"
             print("Dumping", filename)
             with open(filename, "wb") as fd:
                 fd.write(data)
 
-        if args.ghost:
-            # dump ghosty stuff from segment files: not yet committed objects, deleted / superseded objects, commit tags
-
-            # set up the key without depending on a manifest obj
-            for id, cdata, tag, segment, offset in repository.scan_low_level():
-                if tag == TAG_PUT:
-                    key = key_factory(repository, cdata)
-                    repo_objs = RepoObj(key)
-                    break
-            i = 0
-            for id, cdata, tag, segment, offset in repository.scan_low_level(segment=args.segment, offset=args.offset):
-                if tag == TAG_PUT:
-                    decrypt_dump(i, id, cdata, tag="put", segment=segment, offset=offset)
-                elif tag == TAG_DELETE:
-                    decrypt_dump(i, id, None, tag="del", segment=segment, offset=offset)
-                elif tag == TAG_COMMIT:
-                    decrypt_dump(i, None, None, tag="commit", segment=segment, offset=offset)
-                i += 1
-        else:
-            # set up the key without depending on a manifest obj
-            ids = repository.list(limit=1, marker=None)
-            cdata = repository.get(ids[0])
-            key = key_factory(repository, cdata)
-            repo_objs = RepoObj(key)
-            state = None
-            i = 0
-            while True:
-                ids, state = repository.scan(limit=LIST_SCAN_LIMIT, state=state)  # must use on-disk order scanning here
-                if not ids:
-                    break
-                for id in ids:
-                    cdata = repository.get(id)
-                    decrypt_dump(i, id, cdata)
-                    i += 1
+        # set up the key without depending on a manifest obj
+        ids = repository.list(limit=1, marker=None)
+        cdata = repository.get(ids[0])
+        key = key_factory(repository, cdata)
+        repo_objs = RepoObj(key)
+        marker = None
+        while True:
+            ids = repository.list(limit=LIST_SCAN_LIMIT, marker=marker)
+            if not ids:
+                break
+            marker = ids[-1]
+            for id in ids:
+                cdata = repository.get(id)
+                decrypt_dump(id, cdata)
         print("Done.")
 
     @with_repository(manifest=False)
@@ -196,14 +174,15 @@ class DebugMixIn:
         key = key_factory(repository, cdata)
         repo_objs = RepoObj(key)
 
-        state = None
+        marker = None
         last_data = b""
         last_id = None
         i = 0
         while True:
-            ids, state = repository.scan(limit=LIST_SCAN_LIMIT, state=state)  # must use on-disk order scanning here
+            ids = repository.list(limit=LIST_SCAN_LIMIT, marker=marker)
             if not ids:
                 break
+            marker = ids[-1]
             for id in ids:
                 cdata = repository.get(id)
                 _, data = repo_objs.parse(id, cdata, ro_type=ROBJ_DONTCARE)
@@ -330,7 +309,7 @@ class DebugMixIn:
                     repository.delete(id)
                     modified = True
                     print("object %s deleted." % hex_id)
-                except Repository.ObjectNotFound:
+                except Repository3.ObjectNotFound:
                     print("object %s not found." % hex_id)
         if modified:
             repository.commit(compact=False)
@@ -350,23 +329,6 @@ class DebugMixIn:
                     print("object %s has %d referrers [info from chunks cache]." % (hex_id, refcount))
                 except KeyError:
                     print("object %s not found [info from chunks cache]." % hex_id)
-
-    @with_repository(manifest=False, exclusive=True)
-    def do_debug_dump_hints(self, args, repository):
-        """dump repository hints"""
-        if not repository._active_txn:
-            repository.prepare_txn(repository.get_transaction_id())
-        try:
-            hints = dict(
-                segments=repository.segments,
-                compact=repository.compact,
-                storage_quota_use=repository.storage_quota_use,
-                shadow_index={bin_to_hex(k): v for k, v in repository.shadow_index.items()},
-            )
-            with dash_open(args.path, "w") as fd:
-                json.dump(hints, fd, indent=4)
-        finally:
-            repository.rollback()
 
     def do_debug_convert_profile(self, args):
         """convert Borg profile to Python profile"""
@@ -484,30 +446,6 @@ class DebugMixIn:
             help="dump repo objects (debug)",
         )
         subparser.set_defaults(func=self.do_debug_dump_repo_objs)
-        subparser.add_argument(
-            "--ghost",
-            dest="ghost",
-            action="store_true",
-            help="dump all segment file contents, including deleted/uncommitted objects and commits.",
-        )
-        subparser.add_argument(
-            "--segment",
-            metavar="SEG",
-            dest="segment",
-            type=positive_int_validator,
-            default=None,
-            action=Highlander,
-            help="used together with --ghost: limit processing to given segment.",
-        )
-        subparser.add_argument(
-            "--offset",
-            metavar="OFFS",
-            dest="offset",
-            type=positive_int_validator,
-            default=None,
-            action=Highlander,
-            help="used together with --ghost: limit processing to given offset.",
-        )
 
         debug_search_repo_objs_epilog = process_epilog(
             """
@@ -688,23 +626,6 @@ class DebugMixIn:
         )
         subparser.set_defaults(func=self.do_debug_refcount_obj)
         subparser.add_argument("ids", metavar="IDs", nargs="+", type=str, help="hex object ID(s) to show refcounts for")
-
-        debug_dump_hints_epilog = process_epilog(
-            """
-        This command dumps the repository hints data.
-        """
-        )
-        subparser = debug_parsers.add_parser(
-            "dump-hints",
-            parents=[common_parser],
-            add_help=False,
-            description=self.do_debug_dump_hints.__doc__,
-            epilog=debug_dump_hints_epilog,
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            help="dump repo hints (debug)",
-        )
-        subparser.set_defaults(func=self.do_debug_dump_hints)
-        subparser.add_argument("path", metavar="PATH", type=str, help="file to dump data into")
 
         debug_convert_profile_epilog = process_epilog(
             """

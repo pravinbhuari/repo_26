@@ -4,16 +4,16 @@ from unittest.mock import patch
 
 import pytest
 
-from ...cache import Cache, LocalCache, get_cache_impl
+from ...cache import Cache
 from ...constants import *  # NOQA
 from ...helpers import Location, get_security_dir, bin_to_hex
 from ...helpers import EXIT_ERROR
 from ...manifest import Manifest, MandatoryFeatureUnsupported
-from ...remote import RemoteRepository, PathNotAllowed
-from ...repository import Repository
+from ...remote3 import RemoteRepository3, PathNotAllowed
+from ...repository3 import Repository3
 from .. import llfuse
 from .. import changedir
-from . import cmd, _extract_repository_id, open_repository, check_cache, create_test_files
+from . import cmd, _extract_repository_id, create_test_files
 from . import _set_repository_id, create_regular_file, assert_creates_file, generate_archiver_tests, RK_ENCRYPTION
 
 pytest_generate_tests = lambda metafunc: generate_archiver_tests(metafunc, kinds="local,remote")  # NOQA
@@ -25,7 +25,7 @@ def get_security_directory(repo_path):
 
 
 def add_unknown_feature(repo_path, operation):
-    with Repository(repo_path, exclusive=True) as repository:
+    with Repository3(repo_path, exclusive=True) as repository:
         manifest = Manifest.load(repository, Manifest.NO_OPERATION_CHECK)
         manifest.config["feature_flags"] = {operation.value: {"mandatory": ["unknown-feature"]}}
         manifest.write()
@@ -204,17 +204,6 @@ def test_unknown_feature_on_create(archivers, request):
     cmd_raises_unknown_feature(archiver, ["create", "test", "input"])
 
 
-@pytest.mark.skipif(get_cache_impl() in ("adhocwithfiles", "adhoc"), reason="only works with LocalCache")
-def test_unknown_feature_on_cache_sync(archivers, request):
-    # LocalCache.sync checks repo compat
-    archiver = request.getfixturevalue(archivers)
-    cmd(archiver, "rcreate", RK_ENCRYPTION)
-    # delete the cache to trigger a cache sync later in borg create
-    cmd(archiver, "rdelete", "--cache-only")
-    add_unknown_feature(archiver.repository_path, Manifest.Operation.READ)
-    cmd_raises_unknown_feature(archiver, ["create", "test", "input"])
-
-
 def test_unknown_feature_on_change_passphrase(archivers, request):
     archiver = request.getfixturevalue(archivers)
     print(cmd(archiver, "rcreate", RK_ENCRYPTION))
@@ -266,40 +255,24 @@ def test_unknown_feature_on_mount(archivers, request):
     cmd_raises_unknown_feature(archiver, ["mount", mountpoint])
 
 
-@pytest.mark.allow_cache_wipe
 def test_unknown_mandatory_feature_in_cache(archivers, request):
     archiver = request.getfixturevalue(archivers)
     remote_repo = archiver.get_kind() == "remote"
     print(cmd(archiver, "rcreate", RK_ENCRYPTION))
 
-    with Repository(archiver.repository_path, exclusive=True) as repository:
+    with Repository3(archiver.repository_path, exclusive=True) as repository:
         if remote_repo:
             repository._location = Location(archiver.repository_location)
         manifest = Manifest.load(repository, Manifest.NO_OPERATION_CHECK)
         with Cache(repository, manifest) as cache:
-            is_localcache = isinstance(cache, LocalCache)
             cache.begin_txn()
             cache.cache_config.mandatory_features = {"unknown-feature"}
             cache.commit()
 
     if archiver.FORK_DEFAULT:
         cmd(archiver, "create", "test", "input")
-    else:
-        called = False
-        wipe_cache_safe = LocalCache.wipe_cache
 
-        def wipe_wrapper(*args):
-            nonlocal called
-            called = True
-            wipe_cache_safe(*args)
-
-        with patch.object(LocalCache, "wipe_cache", wipe_wrapper):
-            cmd(archiver, "create", "test", "input")
-
-        if is_localcache:
-            assert called
-
-    with Repository(archiver.repository_path, exclusive=True) as repository:
+    with Repository3(archiver.repository_path, exclusive=True) as repository:
         if remote_repo:
             repository._location = Location(archiver.repository_location)
         manifest = Manifest.load(repository, Manifest.NO_OPERATION_CHECK)
@@ -307,65 +280,30 @@ def test_unknown_mandatory_feature_in_cache(archivers, request):
             assert cache.cache_config.mandatory_features == set()
 
 
-def test_check_cache(archivers, request):
-    archiver = request.getfixturevalue(archivers)
-    cmd(archiver, "rcreate", RK_ENCRYPTION)
-    cmd(archiver, "create", "test", "input")
-    with open_repository(archiver) as repository:
-        manifest = Manifest.load(repository, Manifest.NO_OPERATION_CHECK)
-        with Cache(repository, manifest, sync=False) as cache:
-            cache.begin_txn()
-            cache.chunks.incref(list(cache.chunks.iteritems())[0][0])
-            cache.commit()
-            persistent = isinstance(cache, LocalCache)
-    if not persistent:
-        pytest.skip("check_cache is pointless if we do not have a persistent chunks cache")
-    with pytest.raises(AssertionError):
-        check_cache(archiver)
-
-
-@pytest.mark.skipif(get_cache_impl() in ("adhocwithfiles", "adhoc"), reason="only works with LocalCache")
-def test_env_use_chunks_archive(archivers, request, monkeypatch):
-    archiver = request.getfixturevalue(archivers)
-    create_test_files(archiver.input_path)
-    monkeypatch.setenv("BORG_USE_CHUNKS_ARCHIVE", "no")
-    cmd(archiver, "rcreate", RK_ENCRYPTION)
-    repository_id = bin_to_hex(_extract_repository_id(archiver.repository_path))
-    cache_path = os.path.join(archiver.cache_path, repository_id)
-    cmd(archiver, "create", "test", "input")
-    assert os.path.exists(cache_path)
-    assert os.path.exists(os.path.join(cache_path, "chunks.archive.d"))
-    assert len(os.listdir(os.path.join(cache_path, "chunks.archive.d"))) == 0
-    cmd(archiver, "rdelete", "--cache-only")
-    monkeypatch.setenv("BORG_USE_CHUNKS_ARCHIVE", "yes")
-    cmd(archiver, "create", "test2", "input")
-    assert len(os.listdir(os.path.join(cache_path, "chunks.archive.d"))) > 0
-
-
 # Begin Remote Tests
 def test_remote_repo_restrict_to_path(remote_archiver):
     original_location, repo_path = remote_archiver.repository_location, remote_archiver.repository_path
     # restricted to repo directory itself:
-    with patch.object(RemoteRepository, "extra_test_args", ["--restrict-to-path", repo_path]):
+    with patch.object(RemoteRepository3, "extra_test_args", ["--restrict-to-path", repo_path]):
         cmd(remote_archiver, "rcreate", RK_ENCRYPTION)
     # restricted to repo directory itself, fail for other directories with same prefix:
-    with patch.object(RemoteRepository, "extra_test_args", ["--restrict-to-path", repo_path]):
+    with patch.object(RemoteRepository3, "extra_test_args", ["--restrict-to-path", repo_path]):
         with pytest.raises(PathNotAllowed):
             remote_archiver.repository_location = original_location + "_0"
             cmd(remote_archiver, "rcreate", RK_ENCRYPTION)
     # restricted to a completely different path:
-    with patch.object(RemoteRepository, "extra_test_args", ["--restrict-to-path", "/foo"]):
+    with patch.object(RemoteRepository3, "extra_test_args", ["--restrict-to-path", "/foo"]):
         with pytest.raises(PathNotAllowed):
             remote_archiver.repository_location = original_location + "_1"
             cmd(remote_archiver, "rcreate", RK_ENCRYPTION)
     path_prefix = os.path.dirname(repo_path)
     # restrict to repo directory's parent directory:
-    with patch.object(RemoteRepository, "extra_test_args", ["--restrict-to-path", path_prefix]):
+    with patch.object(RemoteRepository3, "extra_test_args", ["--restrict-to-path", path_prefix]):
         remote_archiver.repository_location = original_location + "_2"
         cmd(remote_archiver, "rcreate", RK_ENCRYPTION)
     # restrict to repo directory's parent directory and another directory:
     with patch.object(
-        RemoteRepository, "extra_test_args", ["--restrict-to-path", "/foo", "--restrict-to-path", path_prefix]
+        RemoteRepository3, "extra_test_args", ["--restrict-to-path", "/foo", "--restrict-to-path", path_prefix]
     ):
         remote_archiver.repository_location = original_location + "_3"
         cmd(remote_archiver, "rcreate", RK_ENCRYPTION)
@@ -374,10 +312,10 @@ def test_remote_repo_restrict_to_path(remote_archiver):
 def test_remote_repo_restrict_to_repository(remote_archiver):
     repo_path = remote_archiver.repository_path
     # restricted to repo directory itself:
-    with patch.object(RemoteRepository, "extra_test_args", ["--restrict-to-repository", repo_path]):
+    with patch.object(RemoteRepository3, "extra_test_args", ["--restrict-to-repository", repo_path]):
         cmd(remote_archiver, "rcreate", RK_ENCRYPTION)
     parent_path = os.path.join(repo_path, "..")
-    with patch.object(RemoteRepository, "extra_test_args", ["--restrict-to-repository", parent_path]):
+    with patch.object(RemoteRepository3, "extra_test_args", ["--restrict-to-repository", parent_path]):
         with pytest.raises(PathNotAllowed):
             cmd(remote_archiver, "rcreate", RK_ENCRYPTION)
 
